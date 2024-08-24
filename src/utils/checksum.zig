@@ -31,6 +31,12 @@ pub fn final(self: Self) u16 {
     return ~(@as(u16, @intCast(checksum)));
 }
 
+pub fn fromSlice(slice: []const u8) u16 {
+    var c = Self{};
+    c.addSlice(slice);
+    return c.final();
+}
+
 test {
     var c = Self{};
     c.addInt(u64, 0);

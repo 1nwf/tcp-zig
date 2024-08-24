@@ -1,6 +1,7 @@
 const std = @import("std");
 const log = std.log;
 const linux = std.os.linux;
+const builtin = @import("builtin");
 const c = @cImport({
     @cInclude("linux/ioctl.h");
     @cInclude("linux/sockios.h");

@@ -3,22 +3,22 @@ const ip = @import("ip.zig");
 const CheckSum = @import("../utils/checksum.zig");
 
 const Control = packed struct(u8) {
-    /// Congestion Window Reduced
-    cwr: bool,
-    /// ECN-Echo
-    ece: bool,
-    /// Urgent Pointer field significant
-    urg: bool,
-    /// Acknowledgment field significant
-    ack: bool,
-    /// Push Function
-    psh: bool,
-    /// Reset the connection
-    rst: bool,
-    /// Synchronize sequence numbers
-    syn: bool,
     /// No more data from sender
-    fin: bool,
+    fin: bool = false,
+    /// Synchronize sequence numbers
+    syn: bool = false,
+    /// Reset the connection
+    rst: bool = false,
+    /// Push Function
+    psh: bool = false,
+    /// Acknowledgment field significant
+    ack: bool = false,
+    /// Urgent Pointer field significant
+    urg: bool = false,
+    /// ECN-Echo
+    ece: bool = false,
+    /// Congestion Window Reduced
+    cwr: bool = false,
 };
 
 pub const Header = extern struct {
@@ -37,22 +37,52 @@ pub const Header = extern struct {
     /// indicates where data begins
     data_offset: packed struct(u8) {
         _: u4 = 0, // reserved
-        value: u4,
+        value: u4 = 5, // size of header in 32-bit words
     },
 
-    ctrl: Control,
+    ctrl: Control = .{},
 
     /// The number of data octets beginning with the one indicated in the
     /// acknowledgment field which the sender of this segment is willing to
     /// accept.
     window_size: u16,
     /// Checksum of the ip and tcp header as well as the data.
-    checksum: u16,
-    urgent_pointer: u16,
+    checksum: u16 = 0,
+    urgent_pointer: u16 = 0,
 
     comptime {
         std.debug.assert(@bitSizeOf(Header) / 8 == 20);
         std.debug.assert(@sizeOf(Header) == 20);
+    }
+
+    pub fn calcChecksum(
+        self: *Header,
+        source_ip: [4]u8,
+        dest_ip: [4]u8,
+        options: []const u8,
+        payload: []const u8,
+    ) void {
+        var checksum = CheckSum{};
+        self.checksum = 0;
+        defer self.checksum = @byteSwap(checksum.final()); // update checksum
+
+        var header = self.*;
+        std.mem.byteSwapAllFields(Header, &header);
+        const header_bytes = std.mem.asBytes(&header);
+
+        // calc checksum for psuedo ip header
+        checksum.addSlice(&source_ip);
+        checksum.addSlice(&dest_ip);
+        checksum.addSlice(&.{ 0, @intFromEnum(ip.IpNextHeaderProtocols.Tcp) });
+
+        const len: u16 = @intCast(payload.len + options.len + header_bytes.len);
+        checksum.addInt(u16, @byteSwap(len));
+
+        // add header and payload data
+        checksum.addSlice(header_bytes);
+
+        if (options.len != 0) checksum.addSlice(options);
+        if (payload.len != 0) checksum.addSlice(payload);
     }
 };
 
@@ -82,25 +112,5 @@ pub fn calcChecksum(
     dest_ip: [4]u8,
     payload: []const u8,
 ) void {
-    var checksum = CheckSum{};
-    self.hdr.checksum = 0;
-    defer self.hdr.checksum = @byteSwap(checksum.final()); // update checksum
-
-    var header = self.hdr;
-    std.mem.byteSwapAllFields(Header, &header);
-    const header_bytes = std.mem.asBytes(&header);
-
-    // calc checksum for psuedo ip header
-    checksum.addSlice(&source_ip);
-    checksum.addSlice(&dest_ip);
-    checksum.addSlice(&.{ 0, @intFromEnum(ip.IpNextHeaderProtocols.Tcp) });
-
-    const len: u16 = @intCast(payload.len + self.options.len + header_bytes.len);
-    checksum.addInt(u16, @byteSwap(len));
-
-    // add header and payload data
-    checksum.addSlice(header_bytes);
-
-    if (self.options.len != 0) checksum.addSlice(self.options);
-    if (payload.len != 0) checksum.addSlice(payload);
+    self.hdr.calcChecksum(source_ip, dest_ip, self.options, payload);
 }
