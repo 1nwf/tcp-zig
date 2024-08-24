@@ -106,6 +106,11 @@ pub fn parse(buff: []const u8) Self {
     return self;
 }
 
+pub fn dataOffset(self: Self) usize {
+    const doff: usize = @intCast(self.hdr.data_offset.value);
+    return doff * 4;
+}
+
 pub fn calcChecksum(
     self: *Self,
     source_ip: [4]u8,

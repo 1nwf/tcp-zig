@@ -13,7 +13,7 @@ const PacketReader = struct {
     const Packet = struct {
         iph: ip.Header,
         tcph: TcpHeader,
-        // payload: []const u8,
+        payload: []const u8,
     };
 
     pub fn readPacket(self: *PacketReader) !Packet {
@@ -23,10 +23,13 @@ const PacketReader = struct {
 
         const ip_packet = ip.Packet.parse(data);
         if (ip_packet.header.next_level_protocol != .Tcp) return error.InvalidProtocol;
-
         const tcp_header = TcpHeader.parse(ip_packet.data);
 
-        return .{ .iph = ip_packet.header, .tcph = tcp_header };
+        return .{
+            .iph = ip_packet.header,
+            .tcph = tcp_header,
+            .payload = ip_packet.data[tcp_header.dataOffset()..],
+        };
     }
 };
 
@@ -44,8 +47,7 @@ pub fn main() !void {
     var reader = tun.dev.reader();
     var packet_reader = PacketReader{ .reader = reader.any() };
 
-    _ = try std.Thread.spawn(.{}, connect, .{});
-    std.time.sleep(std.time.ns_per_s * 2);
+    // _ = try std.Thread.spawn(.{}, connect, .{});
 
     while (true) {
         const p = packet_reader.readPacket() catch continue;
@@ -61,11 +63,12 @@ pub fn main() !void {
             break :blk &connections.items[connections.items.len - 1];
         };
 
-        try conn.handle_packet(p.iph, p.tcph);
+        try conn.handle_packet(p.iph, p.tcph, p.payload);
     }
 }
 
 pub fn connect() !void {
+    // std.time.sleep(std.time.ns_per_s * 4);
     _ = try std.net.tcpConnectToAddress(
         try std.net.Address.resolveIp("192.168.0.2", 443),
     );

@@ -33,29 +33,3 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 }
-
-const TunDevice = struct {
-    b: *std.Build,
-    step: std.Build.step,
-    name: []const u8,
-
-    pub fn init(b: *std.Build) !TunDevice {
-        const tapdev = try b.allocator.create(TunDevice);
-        tapdev.* = .{
-            .b = b,
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = "create tun device",
-                .makeFn = makeFn,
-                .owner = b,
-            }),
-        };
-
-        return .{ .b = b, .step = std.Build.Step.create() };
-    }
-
-    fn makeFn(step: *std.Build.Step, _: std.Progress.Node) !void {
-        const self: *TunDevice = @fieldParentPtr("step", step);
-        _ = self;
-    }
-};

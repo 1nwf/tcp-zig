@@ -61,8 +61,8 @@ pub const Header = extern struct {
         };
 
         var swapped = header;
-
         std.mem.byteSwapAllFields(Header, &swapped);
+
         header.checksum = @byteSwap(Checksum.fromSlice(std.mem.asBytes(&swapped)));
         return header;
     }

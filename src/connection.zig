@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log;
 const ip = @import("protocols/ip.zig");
 const TcpHeader = @import("protocols/tcp.zig");
 const Self = @This();
@@ -44,21 +45,35 @@ const SendSequence = struct {
     /// send next
     next: u32,
     /// send window
-    window: u32,
-    urgent_pointer: u32,
+    window: u16,
+    urgent_pointer: u16,
     /// segment sequence number used for last window update
     last_window_update_seq: u32,
     /// segment acknowledgment number used for last window update
     last_window_update_ack: u32,
     /// initial sequence number
     initial_seq: u32,
+
+    // A segment on the retransmission queue is fully acknowledged if the sum of its sequence number
+    // and length is less than or equal to the acknowledgment value in the incoming segment.
+    pub fn isValidAck(self: SendSequence, seg_ack: u32) bool {
+        // TODO: need to handle wrapping sequence numbers
+        return self.unacked < seg_ack and seg_ack <= self.next;
+    }
 };
 
 const RecvSequence = struct {
     next: u32,
-    window: u32,
-    urgent_pointer: u32,
+    window: u16,
+    urgent_pointer: u16,
     initial_seq: u32,
+
+    pub fn isValidRecv(self: *RecvSequence, seq: u32, len: usize) bool {
+        if (self.window == 0) return len == 0 and self.next == seq;
+        if (len == 0) return (self.next <= seq and seq < self.next + self.window);
+        return (self.next <= seq and seq < self.next + self.window) or
+            (self.next <= seq + len and seq + len < self.next + self.window);
+    }
 };
 
 const ConnectionAddress = struct {
@@ -87,11 +102,18 @@ pub fn handle_packet(
     self: *Self,
     ip_header: ip.Header,
     tcp_header: TcpHeader,
+    payload: []const u8,
 ) !void {
+    _ = payload;
     switch (self.state) {
         .listen => {
-            std.log.info("tccp header: {}", .{tcp_header.hdr});
             if (!tcp_header.hdr.ctrl.syn) @panic("packet is not syn");
+            log.info("received syn", .{});
+            defer log.info("sent syn-ack", .{});
+            self.recv_seq.window = tcp_header.hdr.window_size; // TODO update this
+            self.recv_seq.initial_seq = tcp_header.hdr.seq_number;
+            self.recv_seq.next = self.recv_seq.initial_seq + 1;
+
             var syn_ack = TcpHeader.Header{
                 .source_port = tcp_header.hdr.dest_port,
                 .dest_port = tcp_header.hdr.source_port,
@@ -99,26 +121,28 @@ pub fn handle_packet(
                 .seq_number = 300,
                 .ack_number = tcp_header.hdr.seq_number + 1,
                 .data_offset = .{},
-                .window_size = tcp_header.hdr.window_size,
+                .window_size = self.recv_seq.window,
             };
-
             syn_ack.calcChecksum(ip_header.dest_ip, ip_header.source_ip, &.{}, &.{});
-            // const ip_packet = ip.Packet.init(ip_header.dest_ip, ip_header.source_ip, .Tcp, std.mem.asBytes(&syn_ack));
-            // ip.Header.init(ip_header.dest_ip, ip_header.source_ip, .Tcp, @sizeOf(TcpHeader.Header));
-
             const iph = ip.Header.init(ip_header.dest_ip, ip_header.source_ip, .Tcp, @sizeOf(TcpHeader.Header));
-            std.log.info("iph: {}", .{iph});
-
             try self.stream.transmit(iph, TcpHeader{ .hdr = syn_ack }, &.{});
 
-            // self.state = .syn_recvd;
-            self.recv_seq.initial_seq = tcp_header.hdr.seq_number;
+            self.send_seq.next = syn_ack.seq_number + 1;
+            self.send_seq.window = tcp_header.hdr.window_size;
+            self.send_seq.initial_seq = syn_ack.seq_number;
+            self.send_seq.unacked = syn_ack.seq_number;
+            self.state = .syn_recvd;
         },
-
+        // NOTE: simultaneous initiation and duplicate syn recovery is not currently supported
         .syn_recvd => {
+            log.info("received ack", .{});
             if (!tcp_header.hdr.ctrl.ack) @panic("packet is not ack");
+            if (!self.send_seq.isValidAck(tcp_header.hdr.ack_number)) return error.InvaliAck;
+            self.state = .established;
         },
-
+        .established => {
+            log.info("got packet in established state", .{});
+        },
         else => {},
     }
 }
