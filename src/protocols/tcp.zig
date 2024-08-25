@@ -2,26 +2,26 @@ const std = @import("std");
 const ip = @import("ip.zig");
 const CheckSum = @import("../utils/checksum.zig");
 
-const Control = packed struct(u8) {
-    /// No more data from sender
-    fin: bool = false,
-    /// Synchronize sequence numbers
-    syn: bool = false,
-    /// Reset the connection
-    rst: bool = false,
-    /// Push Function
-    psh: bool = false,
-    /// Acknowledgment field significant
-    ack: bool = false,
-    /// Urgent Pointer field significant
-    urg: bool = false,
-    /// ECN-Echo
-    ece: bool = false,
-    /// Congestion Window Reduced
-    cwr: bool = false,
-};
-
 pub const Header = extern struct {
+    pub const Control = packed struct(u8) {
+        /// No more data from sender
+        fin: bool = false,
+        /// Synchronize sequence numbers
+        syn: bool = false,
+        /// Reset the connection
+        rst: bool = false,
+        /// Push Function
+        psh: bool = false,
+        /// Acknowledgment field significant
+        ack: bool = false,
+        /// Urgent Pointer field significant
+        urg: bool = false,
+        /// ECN-Echo
+        ece: bool = false,
+        /// Congestion Window Reduced
+        cwr: bool = false,
+    };
+
     source_port: u16,
     dest_port: u16,
 
@@ -88,8 +88,13 @@ pub const Header = extern struct {
 
 hdr: Header,
 options: []const u8 = &.{},
+payload: []const u8 = &.{},
 
 const Self = @This();
+
+pub fn init(hdr: Header, options: []const u8, payload: []const u8) Self {
+    return .{ .hdr = hdr, .options = options, .payload = payload };
+}
 
 pub fn parse(buff: []const u8) Self {
     var hdr = std.mem.bytesToValue(Header, buff);
@@ -103,6 +108,7 @@ pub fn parse(buff: []const u8) Self {
         self.options = buff[start .. start + end];
     }
 
+    self.payload = buff[self.dataOffset()..];
     return self;
 }
 
@@ -111,11 +117,14 @@ pub fn dataOffset(self: Self) usize {
     return doff * 4;
 }
 
-pub fn calcChecksum(
-    self: *Self,
-    source_ip: [4]u8,
-    dest_ip: [4]u8,
-    payload: []const u8,
-) void {
-    self.hdr.calcChecksum(source_ip, dest_ip, self.options, payload);
+pub fn calcChecksum(self: *Self, source_ip: [4]u8, dest_ip: [4]u8) void {
+    self.hdr.calcChecksum(source_ip, dest_ip, self.options, self.payload);
+}
+
+pub fn size(self: Self) usize {
+    return @sizeOf(Header) + self.options.len + self.payload.len;
+}
+
+pub fn isAck(self: Self) bool {
+    return std.meta.eql(self.hdr.ctrl, .{ .ack = true });
 }
