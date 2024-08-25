@@ -8,10 +8,7 @@ value: usize = 0,
 pub fn addSlice(self: *Self, slice: []const u8) void {
     var window = std.mem.window(u8, slice, 2, 2);
     while (window.next()) |next| {
-        var value = std.mem.readInt(u16, @ptrCast(next.ptr), native_endian);
-        if (next.len == 1) { // if slice num is odd, pad last byte
-            value <<= 8;
-        }
+        const value = std.mem.readInt(u16, @ptrCast(next.ptr), native_endian);
         self.addInt(u16, value);
     }
 }
@@ -44,4 +41,6 @@ test {
 
     try std.testing.expectEqual(0xffff, c.final());
     try std.testing.expectEqual(0, (Self{ .value = 0xffff }).final());
+
+    try std.testing.expectEqual(fromSlice(&.{0xa}), fromSlice(&.{ 0xa, 0 }));
 }
