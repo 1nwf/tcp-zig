@@ -70,3 +70,7 @@ fn ioctl(fd: linux.fd_t, request: u32, arg: usize) !void {
         },
     }
 }
+
+pub fn stream(self: *Self) std.io.StreamSource {
+    return .{ .file = self.dev };
+}
