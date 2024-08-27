@@ -3,6 +3,7 @@ const log = std.log;
 const proto = @import("protocols/protocols.zig");
 const ip = proto.ip;
 const TcpSegment = proto.TcpSegment;
+const TcpStream = @import("stream.zig");
 const Connection = @import("connection.zig");
 pub const StreamSource = @import("stream_source.zig").StreamSource;
 
@@ -50,14 +51,17 @@ stream: std.io.StreamSource,
 connections: ActiveConnections,
 listeners: std.AutoHashMap(u16, TcpListener),
 
+timer: std.time.Timer,
 allocator: std.mem.Allocator,
+retransmit_timeout: u64 = 1 * std.time.ns_per_s,
 
-pub fn init(stream: std.io.StreamSource, allocator: std.mem.Allocator) Self {
+pub fn init(stream: std.io.StreamSource, allocator: std.mem.Allocator) !Self {
     return .{
         .stream = stream,
         .connections = ActiveConnections.init(allocator),
         .listeners = std.AutoHashMap(u16, TcpListener).init(allocator),
         .allocator = allocator,
+        .timer = try std.time.Timer.start(),
     };
 }
 
@@ -66,9 +70,21 @@ pub fn start(self: *Self) !std.Thread {
     return std.Thread.spawn(.{}, processIncoming, .{self});
 }
 
+pub fn retransmitTimeoutElapsed(self: *Self) bool {
+    return self.timer.lap() >= self.retransmit_timeout;
+}
+
 fn processIncoming(self: *Self) !void {
     var reader = PacketReader{ .reader = self.stream.reader().any() };
     while (true) {
+        if (self.retransmitTimeoutElapsed()) {
+            log.info("retransmit timeout elapsed", .{});
+            var iter = self.connections.valueIterator();
+            while (iter.next()) |conn| {
+                try conn.retransmitUnackedSegments(self.retransmit_timeout);
+            }
+        }
+
         const packet = reader.readPacket() catch continue;
         const res = try self.connections.getOrPut(packet.addrs());
         const conn = res.value_ptr;
@@ -96,8 +112,9 @@ fn processIncoming(self: *Self) !void {
 const TcpListener = struct {
     stream: StreamSource(*Connection),
 
-    pub fn accept(self: *TcpListener) !?*Connection {
-        return self.stream.read();
+    pub fn accept(self: *TcpListener) !?TcpStream {
+        const conn = try self.stream.read() orelse return null;
+        return TcpStream.init(conn);
     }
 
     pub fn deinit(self: *TcpListener) void {
@@ -105,6 +122,7 @@ const TcpListener = struct {
     }
 };
 
+/// create a tcp Listener and bind it to a port
 pub fn initListener(self: *Self, port: u16) !*TcpListener {
     const res = try self.listeners.getOrPut(port);
     if (!res.found_existing) {

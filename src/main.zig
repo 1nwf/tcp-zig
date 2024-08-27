@@ -15,7 +15,7 @@ pub fn main() !void {
 
     var arena_alloc = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-    var netif = NetIf.init(tun.stream(), arena_alloc.allocator());
+    var netif = try NetIf.init(tun.stream(), arena_alloc.allocator());
     var handle = try netif.start();
     defer handle.join();
 
@@ -24,9 +24,12 @@ pub fn main() !void {
     _ = try std.Thread.spawn(.{}, connect, .{});
 
     while (try lis.accept()) |conn| {
-        log.info("conn: {}", .{conn.addrs});
+        log.info("conn: {}", .{conn.conn.addrs});
         try conn.send("test...");
-        try conn.close();
+        try conn.send("the network");
+
+        const read = try conn.read();
+        log.info("read: {s}", .{read});
     }
 }
 
@@ -39,6 +42,7 @@ pub fn connect() !void {
     const n = try stream.read(&buff);
     log.info("({}) got: {s}", .{ n, buff[0..n] });
 
+    _ = try stream.write("client data");
     std.time.sleep(std.time.ns_per_s * 2);
 }
 

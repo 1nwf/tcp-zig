@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const log = std.log;
 const ip = @import("protocols/ip.zig");
 const TcpSegment = @import("protocols/tcp.zig");
@@ -114,6 +115,22 @@ pub const Address = struct {
     remote: Ip4Address,
 };
 
+const SegmentSent = struct {
+    iph: ip.Header,
+    seg: TcpSegment,
+    /// instant of when the segment was sent
+    t: std.time.Instant,
+
+    fn init(iph: ip.Header, seg: TcpSegment, t: std.time.Instant) SegmentSent {
+        return .{ .iph = iph, .seg = seg, .t = t };
+    }
+
+    fn shouldRetransmit(self: SegmentSent, timeout_ns: u64) bool {
+        const now = std.time.Instant.now() catch @panic("unable to get time");
+        return now.since(self.t) >= timeout_ns;
+    }
+};
+
 addrs: Address,
 
 state: State,
@@ -122,6 +139,9 @@ recv_seq: RecvSequence,
 writer: PacketWriter,
 // buffer used to store data that was received by this connection
 data_buffer: DataBuffer,
+// a hash map of seq+len and tcp segment
+// TODO: store all bytes sent in one buffer
+unacked_segments: std.AutoHashMap(u32, SegmentSent),
 
 pub fn init(writer: std.io.AnyWriter, addrs: Address, allocator: std.mem.Allocator) Self {
     return .{
@@ -131,6 +151,7 @@ pub fn init(writer: std.io.AnyWriter, addrs: Address, allocator: std.mem.Allocat
         .recv_seq = std.mem.zeroes(RecvSequence),
         .writer = .{ .writer = writer },
         .data_buffer = DataBuffer.init(allocator),
+        .unacked_segments = std.AutoHashMap(u32, SegmentSent).init(allocator),
     };
 }
 
@@ -165,7 +186,7 @@ pub fn handle_segment(
         // NOTE: simultaneous initiation and duplicate syn recovery is not currently supported
         .syn_recvd => {
             log.info("received ack: {}", .{segment.hdr.ack_number});
-            if (!segment.hdr.ctrl.ack) {
+            if (!segment.isAck()) {
                 log.info("packet is not ack", .{});
                 return;
             }
@@ -175,18 +196,25 @@ pub fn handle_segment(
             self.state = .established;
         },
         .established => {
-            std.debug.assert(segment.hdr.ack_number == self.send_seq.next);
+            std.debug.assert(segment.hdr.ack_number <= self.send_seq.next);
             if (!self.recv_seq.isValidRecv(segment.hdr.seq_number, segment.payload.len)) return error.InvalidRecv;
-            // received an ack packet. ignore for now
-            if (segment.isAck()) return;
+
+            // received an ack for an earlier sent segment
+            if (segment.isAck()) {
+                self.handleSegmentAck(segment.hdr.ack_number);
+                return;
+            }
+
             // recieved connection termination request
-            if (std.meta.eql(segment.hdr.ctrl, .{ .fin = true, .ack = true })) self.state = .close_wait;
+            if (std.meta.eql(segment.hdr.ctrl, .{ .fin = true, .ack = true })) {
+                self.state = .close_wait;
+            }
 
             if (segment.payload.len != 0) {
                 try self.data_buffer.write(segment.payload);
             }
 
-            self.recv_seq.next = @intCast(segment.hdr.seq_number + @max(1, segment.payload.len));
+            self.recv_seq.next += @intCast(@max(1, segment.payload.len));
             try self.transmit(.{ .ack = true }, &.{});
         },
         .fin_wait_1 => {
@@ -213,23 +241,34 @@ pub fn send(self: *Self, data: []const u8) !void {
 }
 
 fn transmit(self: *Self, ctl: TcpSegment.Header.Control, data: []const u8) !void {
-    var tcph = TcpSegment.init(.{
-        .source_port = self.addrs.local.port,
-        .dest_port = self.addrs.remote.port,
-        .ctrl = ctl,
-        .seq_number = self.send_seq.next,
-        .ack_number = self.recv_seq.next,
-        .data_offset = .{},
-        .window_size = self.recv_seq.window,
-    }, &.{}, data);
-    tcph.calcChecksum(self.addrs.local.addr, self.addrs.remote.addr);
+    const seg = self.constructSegment(ctl, data);
+    const iph = ip.Header.init(self.addrs.local.addr, self.addrs.remote.addr, .Tcp, seg.size());
+    try self.writer.transmit(iph, seg);
 
-    const iph = ip.Header.init(self.addrs.local.addr, self.addrs.remote.addr, .Tcp, tcph.size());
-    try self.writer.transmit(iph, tcph);
-
-    if (!std.meta.eql(ctl, .{ .ack = true })) {
+    if (!seg.isAck()) {
         // if this is not an ack packet, update the seq next value
-        defer self.send_seq.next += @intCast(@max(1, data.len));
+        self.send_seq.next += @intCast(@max(1, data.len));
+        try self.unacked_segments.putNoClobber(
+            @intCast(seg.hdr.seq_number + data.len),
+            SegmentSent.init(iph, seg, try std.time.Instant.now()),
+        );
+    }
+}
+
+pub fn handleSegmentAck(self: *Self, seq: u32) void {
+    const value = self.unacked_segments.getPtr(seq) orelse @panic("acked segment does not exist");
+    // update send unacked value
+    self.send_seq.unacked += @intCast(value.seg.payload.len);
+    // remove value from unacked_segments
+    _ = self.unacked_segments.remove(seq);
+}
+
+pub fn retransmitUnackedSegments(self: *Self, timeout_ns: u64) !void {
+    var iter = self.unacked_segments.valueIterator();
+    while (iter.next()) |value| {
+        if (value.shouldRetransmit(timeout_ns)) {
+            try self.writer.transmit(value.iph, value.seg);
+        }
     }
 }
 
@@ -243,4 +282,18 @@ pub fn close(self: *Self) !void {
         .established => .fin_wait_1,
         else => unreachable,
     };
+}
+
+fn constructSegment(self: *Self, ctl: TcpSegment.Header.Control, data: []const u8) TcpSegment {
+    var seg = TcpSegment.init(.{
+        .source_port = self.addrs.local.port,
+        .dest_port = self.addrs.remote.port,
+        .ctrl = ctl,
+        .seq_number = self.send_seq.next,
+        .ack_number = self.recv_seq.next,
+        .data_offset = .{},
+        .window_size = self.recv_seq.window,
+    }, &.{}, data);
+    seg.calcChecksum(self.addrs.local.addr, self.addrs.remote.addr);
+    return seg;
 }
