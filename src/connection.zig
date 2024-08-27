@@ -191,6 +191,8 @@ pub fn handle_segment(
                 return;
             }
 
+            self.handleSegmentAck(segment.hdr.ack_number);
+
             if (!self.send_seq.isValidAck(segment.hdr.ack_number)) return error.InvalidAck;
             if (!self.recv_seq.isValidRecv(segment.hdr.seq_number, segment.payload.len)) return error.InvalidRecvSeq;
             self.state = .established;
@@ -249,7 +251,7 @@ fn transmit(self: *Self, ctl: TcpSegment.Header.Control, data: []const u8) !void
         // if this is not an ack packet, update the seq next value
         self.send_seq.next += @intCast(@max(1, data.len));
         try self.unacked_segments.putNoClobber(
-            @intCast(seg.hdr.seq_number + data.len),
+            @intCast(seg.hdr.seq_number + @max(1, data.len)),
             SegmentSent.init(iph, seg, try std.time.Instant.now()),
         );
     }
@@ -268,6 +270,8 @@ pub fn retransmitUnackedSegments(self: *Self, timeout_ns: u64) !void {
     while (iter.next()) |value| {
         if (value.shouldRetransmit(timeout_ns)) {
             try self.writer.transmit(value.iph, value.seg);
+            // update send time
+            value.t = try std.time.Instant.now();
         }
     }
 }
