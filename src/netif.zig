@@ -77,12 +77,26 @@ pub fn retransmitTimeoutElapsed(self: *Self) bool {
 fn processIncoming(self: *Self) !void {
     var reader = PacketReader{ .reader = self.stream.reader().any() };
     while (true) {
+        switch (self.stream) {
+            .file => |f| {
+                // if the stream source is a file, use poll with the specified retransmission timeout to make sure that read does not block indefinitely
+                // and retransmissions are sent on time
+                var fds = [_]std.posix.pollfd{.{ .fd = f.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                const ret = try std.posix.poll(&fds, @intCast(self.retransmit_timeout / std.time.ns_per_ms));
+                std.debug.assert(ret == 0 or ret == 1);
+            },
+            else => {},
+        }
+
         if (self.retransmitTimeoutElapsed()) {
             log.info("retransmit timeout elapsed", .{});
             var iter = self.connections.valueIterator();
             while (iter.next()) |conn| {
                 try conn.retransmitUnackedSegments(self.retransmit_timeout);
             }
+            // continue because if poll returned 0 (timed-out)
+            // we don't want to block on the following read
+            continue;
         }
 
         const packet = reader.readPacket() catch continue;
