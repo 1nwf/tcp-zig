@@ -119,6 +119,10 @@ fn processIncoming(self: *Self) !void {
             } else {
                 try lis.stream.write(conn);
             }
+        } else if (conn.state == .closed or conn.state == .time_wait) {
+            // deinit and remove connection
+            conn.deinit();
+            std.debug.assert(self.connections.remove(conn.addrs));
         }
     }
 }

@@ -83,7 +83,6 @@ pub const Packet = struct {
         payload_type: IpNextHeaderProtocols,
         data: []const u8,
     ) Packet {
-        var checksum = Checksum{};
         var header = Header{
             .source_ip = source_ip,
             .dest_ip = dest_ip,
@@ -94,9 +93,7 @@ pub const Packet = struct {
             .total_length = @intCast(@sizeOf(Header) + data.len),
             .ffo = .{},
         };
-        checksum.addSlice(std.mem.asBytes(&header));
-        header.checksum = checksum.final();
-
+        header.checksum = Checksum.fromSlice(std.mem.asBytes(&header));
         return .{ .header = header, .data = data };
     }
 

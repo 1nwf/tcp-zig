@@ -155,15 +155,30 @@ pub fn init(writer: std.io.AnyWriter, addrs: Address, allocator: std.mem.Allocat
     };
 }
 
+// TODO: handle reset
 pub fn handle_segment(
     self: *Self,
     segment: TcpSegment,
 ) !void {
-    if (self.state != .listen) {
+    if (self.state != .listen and self.state != .syn_sent) {
         if (!self.send_seq.isValidAck(segment.hdr.ack_number)) return error.InvalidAck;
         if (!self.recv_seq.isValidRecv(segment.hdr.seq_number, segment.payload.len)) return error.InvalidRecvSeq;
     }
+
+    // remove from retransmit queue and update send.unacked
+    if (segment.isAck()) self.handleSegmentAck(segment.hdr.ack_number);
     switch (self.state) {
+        .syn_sent => {
+            std.debug.assert(std.meta.eql(segment.hdr.ctrl, .{ .syn = true, .ack = true }));
+
+            self.recv_seq.window = segment.hdr.window_size; // TODO update this
+            self.recv_seq.initial_seq = segment.hdr.seq_number;
+            self.recv_seq.next = self.recv_seq.initial_seq + 1;
+            self.send_seq.window = segment.hdr.window_size;
+
+            try self.transmit(.{ .ack = true }, &.{});
+            self.state = .established;
+        },
         .listen => {
             if (!segment.hdr.ctrl.syn) {
                 log.info("packet is not syn", .{});
@@ -191,21 +206,11 @@ pub fn handle_segment(
                 return;
             }
 
-            self.handleSegmentAck(segment.hdr.ack_number);
-
-            if (!self.send_seq.isValidAck(segment.hdr.ack_number)) return error.InvalidAck;
-            if (!self.recv_seq.isValidRecv(segment.hdr.seq_number, segment.payload.len)) return error.InvalidRecvSeq;
             self.state = .established;
         },
         .established => {
-            std.debug.assert(segment.hdr.ack_number <= self.send_seq.next);
-            if (!self.recv_seq.isValidRecv(segment.hdr.seq_number, segment.payload.len)) return error.InvalidRecv;
-
             // received an ack for an earlier sent segment
-            if (segment.isAck()) {
-                self.handleSegmentAck(segment.hdr.ack_number);
-                return;
-            }
+            if (segment.isAck()) return;
 
             // recieved connection termination request
             if (std.meta.eql(segment.hdr.ctrl, .{ .fin = true, .ack = true })) {
@@ -220,8 +225,14 @@ pub fn handle_segment(
             try self.transmit(.{ .ack = true }, &.{});
         },
         .fin_wait_1 => {
-            std.debug.assert(segment.hdr.ctrl.ack);
-            self.state = .fin_wait_2;
+            // handle simultaneous close sequence
+            if (std.meta.eql(segment.hdr.ctrl, .{ .fin = true, .ack = true })) {
+                self.recv_seq.next += @intCast(@max(1, segment.payload.len));
+                try self.transmit(.{ .ack = true }, &.{});
+                self.state = .closing;
+            } else if (segment.isAck()) {
+                self.state = .fin_wait_2;
+            } else @panic("invalid segment");
         },
         .fin_wait_2 => {
             std.debug.assert(segment.hdr.ctrl.ack);
@@ -231,8 +242,23 @@ pub fn handle_segment(
             try self.transmit(.{ .ack = true }, &.{});
             self.state = .time_wait;
         },
-        .close_wait => {},
-        .last_ack => {},
+        .close_wait => {
+            if (segment.payload.len != 0) {
+                try self.data_buffer.write(segment.payload);
+            }
+        },
+        .closing => {
+            std.debug.assert(segment.isAck());
+            self.state = .time_wait;
+        },
+        .last_ack => {
+            std.debug.assert(segment.isAck());
+            self.state = .closed;
+        },
+        .time_wait => {
+            // must wait for 2xMSL(max segment lifetime)
+            // before closing a connection
+        },
         else => {},
     }
 }
@@ -278,7 +304,7 @@ pub fn retransmitUnackedSegments(self: *Self, timeout_ns: u64) !void {
 
 /// closing a connection blocks the user from sending more data, but still allows receiving data from the remote connection
 pub fn close(self: *Self) !void {
-    if (self.state != .established) return error.ConnNotEstablished;
+    if (self.state != .established and self.state != .close_wait) return error.ConnNotEstablished;
     try self.transmit(.{ .ack = true, .fin = true }, &.{});
 
     self.state = switch (self.state) {
@@ -301,3 +327,191 @@ fn constructSegment(self: *Self, ctl: TcpSegment.Header.Control, data: []const u
     seg.calcChecksum(self.addrs.local.addr, self.addrs.remote.addr);
     return seg;
 }
+
+pub fn deinit(self: *Self) void {
+    self.unacked_segments.deinit();
+    self.data_buffer.deinit();
+}
+
+// currently only used for testing
+// needs update
+fn connect(self: *Self) !void {
+    self.send_seq.initial_seq = 300;
+    self.send_seq.unacked = 300;
+    self.send_seq.next = 301;
+
+    try self.transmit(.{ .syn = true }, &.{});
+    self.state = .syn_sent;
+}
+
+test "3-way handshake" {
+    var s1 = TestBuffStream.init();
+    var s2 = TestBuffStream.init();
+    defer s1.deinit();
+    defer s2.deinit();
+
+    var t1 = TestConn.init(std.mem.zeroes(Address), s1.writer(), s2.reader());
+    var t2 = TestConn.init(std.mem.zeroes(Address), s2.writer(), s1.reader());
+    defer t1.conn.deinit();
+    defer t2.conn.deinit();
+
+    // sent syn segment
+    try t1.conn.connect();
+    try std.testing.expectEqual(t1.conn.state, State.syn_sent);
+    try std.testing.expectEqual(t2.conn.state, State.listen);
+
+    // process syn segment and send syn-ack
+    try t2.process();
+    try std.testing.expectEqual(t2.conn.state, State.syn_recvd);
+
+    // process syn-ack and send ack
+    try t1.process();
+    try std.testing.expectEqual(t1.conn.state, State.established);
+
+    // process ack and update state
+    try t2.process();
+    try std.testing.expectEqual(t2.conn.state, State.established);
+
+    // check that no data was written from previous call
+    try std.testing.expectEqual(s1.buff.items.len, 0);
+    try std.testing.expectEqual(s2.buff.items.len, 0);
+}
+
+test "close" {
+    var s1 = TestBuffStream.init();
+    var s2 = TestBuffStream.init();
+    defer s1.deinit();
+    defer s2.deinit();
+
+    var t1 = TestConn.init(std.mem.zeroes(Address), s1.writer(), s2.reader());
+    var t2 = TestConn.init(std.mem.zeroes(Address), s2.writer(), s1.reader());
+    defer t1.conn.deinit();
+    defer t2.conn.deinit();
+
+    try t1.finishHandshake(&t2);
+
+    try t1.conn.close();
+    try std.testing.expectEqual(t1.conn.state, State.fin_wait_1);
+
+    try t2.process();
+    try std.testing.expectEqual(t2.conn.state, State.close_wait);
+
+    try t1.process();
+    try std.testing.expectEqual(t1.conn.state, State.fin_wait_2);
+
+    try t2.conn.close();
+    try std.testing.expectEqual(t2.conn.state, State.last_ack);
+
+    try t1.process();
+    try std.testing.expectEqual(t1.conn.state, State.time_wait);
+
+    // NOTE: state should be updated?
+    try t2.process();
+    try std.testing.expectEqual(t2.conn.state, State.closed);
+}
+
+test "simultaneous close" {
+    var s1 = TestBuffStream.init();
+    var s2 = TestBuffStream.init();
+    defer s1.deinit();
+    defer s2.deinit();
+
+    var t1 = TestConn.init(std.mem.zeroes(Address), s1.writer(), s2.reader());
+    var t2 = TestConn.init(std.mem.zeroes(Address), s2.writer(), s1.reader());
+    defer t1.conn.deinit();
+    defer t2.conn.deinit();
+
+    try t1.finishHandshake(&t2);
+
+    try t1.conn.close();
+    try t2.conn.close();
+    try std.testing.expectEqual(t1.conn.state, State.fin_wait_1);
+    try std.testing.expectEqual(t2.conn.state, State.fin_wait_1);
+
+    try t2.process();
+    try t1.process();
+    try std.testing.expectEqual(t2.conn.state, State.closing);
+    try std.testing.expectEqual(t1.conn.state, State.closing);
+
+    try t2.process();
+    try t1.process();
+    try std.testing.expectEqual(t2.conn.state, State.time_wait);
+    try std.testing.expectEqual(t1.conn.state, State.time_wait);
+}
+
+const TestBuffStream = struct {
+    buff: std.ArrayList([]u8),
+    allocator: std.mem.Allocator,
+    pub fn init() TestBuffStream {
+        return .{
+            .buff = std.ArrayList([]u8).init(std.testing.allocator),
+            .allocator = std.testing.allocator,
+        };
+    }
+
+    pub fn reader(self: *const TestBuffStream) std.io.AnyReader {
+        return .{ .context = @ptrCast(self), .readFn = @ptrCast(&read) };
+    }
+
+    pub fn writer(self: *const TestBuffStream) std.io.AnyWriter {
+        return .{ .context = @ptrCast(self), .writeFn = @ptrCast(&write) };
+    }
+
+    fn read(self: *TestBuffStream, buffer: []u8) anyerror!usize {
+        if (self.buff.items.len == 0) return error.NoData;
+        const data = self.buff.orderedRemove(0);
+        defer self.allocator.free(data);
+
+        if (buffer.len < data.len) return error.BuffTooSmall;
+        @memcpy(buffer[0..data.len], data);
+        return data.len;
+    }
+
+    fn write(self: *TestBuffStream, bytes: []const u8) anyerror!usize {
+        const slice = try self.allocator.alloc(u8, bytes.len);
+        @memcpy(slice, bytes);
+        try self.buff.append(slice);
+        return bytes.len;
+    }
+
+    fn deinit(self: *TestBuffStream) void {
+        // for (self.buff.items) |d| self.allocator.free(d);
+        self.buff.deinit();
+    }
+};
+
+const TestConn = struct {
+    conn: Self,
+    reader: std.io.AnyReader,
+
+    pub fn init(addrs: Address, writer: std.io.AnyWriter, reader: std.io.AnyReader) TestConn {
+        return .{ .conn = Self.init(writer, addrs, std.testing.allocator), .reader = reader };
+    }
+
+    pub fn process(self: *TestConn) !void {
+        var buff: [std.mem.page_size]u8 = std.mem.zeroes([std.mem.page_size]u8);
+        const n = try self.reader.read(&buff);
+        const data = buff[0..n];
+
+        const iph = ip.Packet.parse(data);
+        const seg = TcpSegment.parse(iph.data);
+
+        try self.conn.handle_segment(seg);
+    }
+
+    pub fn finishHandshake(self: *TestConn, other: *TestConn) !void {
+        // sent syn segment
+        try self.conn.connect();
+        try std.testing.expectEqual(self.conn.state, State.syn_sent);
+        try std.testing.expectEqual(other.conn.state, State.listen);
+        // process syn segment and send syn-ack
+        try other.process();
+        try std.testing.expectEqual(other.conn.state, State.syn_recvd);
+        // process syn-ack and send ack
+        try self.process();
+        try std.testing.expectEqual(self.conn.state, State.established);
+        // process ack and update state
+        try other.process();
+        try std.testing.expectEqual(other.conn.state, State.established);
+    }
+};
