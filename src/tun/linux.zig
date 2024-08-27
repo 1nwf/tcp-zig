@@ -35,18 +35,20 @@ pub fn deinit(self: *Self) void {
     std.posix.close(self.sock_fd);
 }
 
-pub fn setIpAddr(self: *Self, addr: std.net.Address) !void {
+pub fn setIpAddr(self: *Self, addr: []const u8) !void {
+    const ipaddr = try std.net.Address.parseIp(addr, 0);
     var ifreq = linux.ifreq{
         .ifrn = .{ .name = @as(*[linux.IFNAMESIZE]u8, @ptrCast(@constCast(self.name.ptr))).* },
-        .ifru = .{ .addr = addr.any },
+        .ifru = .{ .addr = ipaddr.any },
     };
     try ioctl(self.sock_fd, c.SIOCSIFADDR, @intFromPtr(&ifreq));
 }
 
-pub fn setNetMask(self: *Self, mask: std.net.Address) !void {
+pub fn setNetMask(self: *Self, mask: []const u8) !void {
+    const addr = try std.net.Address.parseIp(mask, 0);
     var ifreq = linux.ifreq{
         .ifrn = .{ .name = @as(*[linux.IFNAMESIZE]u8, @ptrCast(@constCast(self.name.ptr))).* },
-        .ifru = .{ .netmask = mask.any },
+        .ifru = .{ .netmask = addr.any },
     };
     try ioctl(self.sock_fd, c.SIOCSIFNETMASK, @intFromPtr(&ifreq));
 }

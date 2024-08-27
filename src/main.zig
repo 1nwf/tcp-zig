@@ -8,8 +8,8 @@ const NetIf = @import("netif.zig");
 
 pub fn main() !void {
     var tun = try TunDev.init("tun0");
-    try tun.setIpAddr(try std.net.Address.parseIp("192.168.0.1", 0));
-    try tun.setNetMask(try std.net.Address.parseIp("255.255.255.0", 0));
+    try tun.setIpAddr("192.168.0.1");
+    try tun.setNetMask("255.255.255.0");
     try tun.setDevUp();
     defer tun.deinit();
 
