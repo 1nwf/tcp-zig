@@ -341,11 +341,15 @@ pub fn handleSegmentAck(self: *Self, hdr: TcpSegment.Header) !void {
     // return if the sequence ack is invalid
     self.send_seq.ack(hdr.ack_number) catch return;
 
-    const entry = self.unacked_segments.fetchOrderedRemove(hdr.ack_number) orelse return error.InvalidAck;
-    const segment = entry.value.seg;
-    // free allocated data
-    if (segment.payload.len != 0) {
-        self.allocator.free(segment.payload);
+    const segment_idx = self.unacked_segments.getIndex(hdr.ack_number) orelse return error.InvalidAck;
+    for (0..segment_idx + 1) |_| {
+        const key = self.unacked_segments.keys()[0];
+        const entry = self.unacked_segments.fetchOrderedRemove(key) orelse unreachable;
+        const segment = entry.value.seg;
+        // free allocated data
+        if (segment.payload.len != 0) {
+            self.allocator.free(segment.payload);
+        }
     }
 }
 
@@ -626,4 +630,40 @@ test "send ack" {
     try expectEqual(319, t1.conn.send_seq.next);
     try expectEqual(0, t1.conn.unacked_segments.count());
     try expectEqual(0, t1.conn.send_buffer.items.len);
+}
+
+test "ack multiple segments" {
+    var s1 = TestBuffStream.init();
+    var s2 = TestBuffStream.init();
+    defer s1.deinit();
+    defer s2.deinit();
+
+    var t1 = TestConn.init(std.mem.zeroes(Address), s1.writer(), s2.reader());
+    var t2 = TestConn.init(std.mem.zeroes(Address), s2.writer(), s1.reader());
+    defer t1.conn.deinit();
+    defer t2.conn.deinit();
+
+    try t1.finishHandshake(&t2);
+
+    // send segments
+    try t1.conn.send("test...");
+    try t1.conn.flush();
+
+    try t1.conn.send("the network");
+    try t1.conn.flush();
+
+    // handle ack both segments
+    try t1.conn.handle_segment(.{
+        .hdr = .{
+            .source_port = 0,
+            .dest_port = 0,
+            .seq_number = t2.conn.send_seq.next,
+            .ack_number = t2.conn.recv_seq.next + 18,
+            .ctrl = .{ .ack = true },
+            .window_size = 6400,
+            .data_offset = .{},
+        },
+    });
+
+    try expectEqual(0, t1.conn.unacked_segments.count());
 }
