@@ -14,10 +14,15 @@ pub fn send(self: Self, data: []const u8) !void {
     try self.conn.send(data);
 }
 
-pub fn read(self: Self) ![]const u8 {
-    return self.conn.data_buffer.read();
+pub fn read(self: Self, buff: []u8) !usize {
+    return self.conn.data_buffer.read(buff);
 }
 
 pub fn close(self: Self) !void {
+    try self.flush();
     try self.conn.close();
+}
+
+pub fn flush(self: Self) !void {
+    try self.conn.flush();
 }

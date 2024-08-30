@@ -10,7 +10,7 @@ pub const Header = extern struct {
         syn: bool = false,
         /// Reset the connection
         rst: bool = false,
-        /// Push Function
+        /// Push Function, dont buffer data and send later
         psh: bool = false,
         /// Acknowledgment field significant
         ack: bool = false,
@@ -127,4 +127,12 @@ pub fn size(self: Self) usize {
 
 pub fn isAck(self: Self) bool {
     return std.meta.eql(self.hdr.ctrl, .{ .ack = true });
+}
+
+pub fn isCtrl(self: Self, ctrl: Header.Control) bool {
+    return std.meta.eql(self.hdr.ctrl, ctrl);
+}
+
+pub fn endSequence(self: Self) u32 {
+    return self.hdr.seq_number + @max(1, self.payload.len) - 1;
 }

@@ -27,25 +27,29 @@ pub fn main() !void {
         log.info("conn: {}", .{conn.conn.addrs});
         try conn.send("test...");
         try conn.send("the network");
+        try conn.flush();
 
-        const read = try conn.read();
-        log.info("read: {s}", .{read});
+        var buff: [128]u8 = undefined;
+        const n = try conn.read(&buff);
+        log.info("read: {s}", .{buff[0..n]});
+        try conn.close();
     }
 }
 
 pub fn connect() !void {
     std.time.sleep(std.time.ns_per_s * 3);
     const stream = try std.net.tcpConnectToAddress(try std.net.Address.resolveIp("192.168.0.2", 800));
-    defer stream.close();
 
     var buff: [1024]u8 = undefined;
     const n = try stream.read(&buff);
     log.info("({}) got: {s}", .{ n, buff[0..n] });
 
     _ = try stream.write("client data");
-    std.time.sleep(std.time.ns_per_s * 2);
+    stream.close();
+    std.time.sleep(std.time.ns_per_s * 1);
 }
 
 test {
     _ = @import("utils/checksum.zig");
+    _ = Connection;
 }
