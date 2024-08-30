@@ -1,26 +1,35 @@
 const std = @import("std");
-const log = std.log;
+const log = std.log.scoped(.netif);
 const proto = @import("protocols/protocols.zig");
 const ip = proto.ip;
 const TcpSegment = proto.TcpSegment;
 const TcpStream = @import("stream.zig");
 const Connection = @import("connection.zig");
-pub const StreamSource = @import("stream_source.zig").StreamSource;
+const StreamSource = @import("stream_source.zig").StreamSource;
+const Ip4Address = Connection.Ip4Address;
 
 const Packet = struct {
     iph: ip.Header,
     seg: TcpSegment,
 
+    pub fn localAddr(self: Packet) Ip4Address {
+        return .{
+            .addr = self.iph.source_ip,
+            .port = self.seg.hdr.source_port,
+        };
+    }
+
+    pub fn remoteAddr(self: Packet) Ip4Address {
+        return .{
+            .addr = self.iph.dest_ip,
+            .port = self.seg.hdr.dest_port,
+        };
+    }
+
     pub fn addrs(self: Packet) Connection.Address {
         return .{
-            .local = .{
-                .addr = self.iph.dest_ip,
-                .port = self.seg.hdr.dest_port,
-            },
-            .remote = .{
-                .addr = self.iph.source_ip,
-                .port = self.seg.hdr.source_port,
-            },
+            .local = self.remoteAddr(),
+            .remote = self.localAddr(),
         };
     }
 };
@@ -74,6 +83,10 @@ pub fn retransmitTimeoutElapsed(self: *Self) bool {
     return self.timer.lap() >= self.retransmit_timeout;
 }
 
+fn hasListener(self: *const Self, port: u16) bool {
+    return self.listeners.get(port) != null;
+}
+
 fn processIncoming(self: *Self) !void {
     var reader = PacketReader{ .reader = self.stream.reader().any() };
     while (true) {
@@ -100,13 +113,23 @@ fn processIncoming(self: *Self) !void {
         }
 
         const packet = reader.readPacket() catch continue;
+
+        if (!self.hasListener(packet.remoteAddr().port)) {
+            log.warn("no listener exists for {}", .{packet.remoteAddr()});
+            continue;
+        }
+
         const res = try self.connections.getOrPut(packet.addrs());
         const conn = res.value_ptr;
         if (!res.found_existing) {
             conn.* = Connection.init(self.stream.writer().any(), packet.addrs(), self.allocator);
         }
         const syn_recv = conn.state == .syn_recvd;
-        try conn.handle_segment(packet.seg);
+        conn.handle_segment(packet.seg) catch |err| {
+            log.err("tcp segment error: {}", .{err});
+            continue;
+        };
+
         if (syn_recv and conn.state == .established) {
             const dest_port = packet.seg.hdr.dest_port;
             // connection established, notify listener
@@ -120,6 +143,7 @@ fn processIncoming(self: *Self) !void {
                 try lis.stream.write(conn);
             }
         } else if (conn.state == .closed or conn.state == .time_wait) {
+            log.info("closing the connection", .{});
             // deinit and remove connection
             conn.deinit();
             std.debug.assert(self.connections.remove(conn.addrs));
